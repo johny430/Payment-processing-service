@@ -1,0 +1,108 @@
+name: payment-processing-service
+
+x-app: &app
+  build: .
+  image: payment-processing-service:local
+  restart: unless-stopped
+  security_opt:
+    - no-new-privileges:true
+  environment:
+    ENVIRONMENT: Prod
+    LOG_LEVEL: INFO
+    API_KEY: ${API_KEY:-change-me}
+    DB_HOST: postgres
+    DB_PORT: 5432
+    DB_USERNAME: ${DB_USERNAME:-postgres}
+    DB_PASSWORD: ${DB_PASSWORD:-postgres}
+    DB_NAME: ${DB_NAME:-payments}
+    RABBITMQ_HOST: rabbitmq
+    RABBITMQ_PORT: 5672
+    RABBITMQ_USER: ${RABBITMQ_USER:-guest}
+    RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-guest}
+
+x-depends-on-infra: &depends-on-infra
+  migrations:
+    condition: service_completed_successfully
+  rabbitmq:
+    condition: service_healthy
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_NAME:-payments}
+      POSTGRES_USER: ${DB_USERNAME:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres}
+    ports:
+      - ${POSTGRES_HOST_PORT:-5432}:5432
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  rabbitmq:
+    image: rabbitmq:4-management-alpine
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-guest}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-guest}
+    ports:
+      - ${RABBITMQ_HOST_PORT:-5672}:5672
+      - ${RABBITMQ_MANAGEMENT_HOST_PORT:-15672}:15672
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 20s
+
+  migrations:
+    <<: *app
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    <<: *app
+    command: ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers"]
+    ports:
+      - ${API_HOST_PORT:-8000}:8000
+    depends_on:
+      migrations:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthcheck')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  outbox-relay:
+    <<: *app
+    command: ["faststream", "run", "src.outbox_relay:app"]
+    depends_on: *depends-on-infra
+
+  consumer:
+    <<: *app
+    command: ["faststream", "run", "src.consumer:app"]
+    depends_on: *depends-on-infra
+
+  # Демонстрационный приёмник webhook: /webhook отвечает 200, /webhook/fail — 500
+  webhook-receiver:
+    build: .
+    image: payment-processing-service:local
+    restart: unless-stopped
+    command: ["uvicorn", "tools.webhook_receiver:app", "--host", "0.0.0.0", "--port", "8080"]
+    ports:
+      - ${WEBHOOK_RECEIVER_HOST_PORT:-8081}:8080
+
+volumes:
+  postgres-data:
+  rabbitmq-data:
